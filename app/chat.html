@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 RAG Chatbot</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            height: 100vh; 
+            display: flex; 
+            align-items: center; 
+            justify-content: center; 
+        }
+        .chat-container { 
+            width: 90%; max-width: 800px; 
+            height: 90vh; 
+            background: white; 
+            border-radius: 20px; 
+            box-shadow: 0 25px 50px rgba(0,0,0,0.15);
+            display: flex; 
+            flex-direction: column; 
+            overflow: hidden;
+        }
+        .chat-header { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white; 
+            padding: 25px; 
+            text-align: center; 
+        }
+        .chat-header h1 { font-size: 1.8em; margin-bottom: 5px; }
+        .chat-header p { opacity: 0.9; font-size: 1.1em; }
+        .chat-messages { 
+            flex: 1; 
+            padding: 25px; 
+            overflow-y: auto;
+            background: #f8f9fa;
+        }
+        .message { 
+            margin-bottom: 20px; 
+            display: flex; 
+            animation: fadeIn 0.3s ease;
+        }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .user-message { flex-direction: row-reverse; }
+        .message-content { 
+            max-width: 75%; 
+            padding: 15px 20px; 
+            border-radius: 20px; 
+            word-wrap: break-word;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .user-message .message-content { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white; 
+        }
+        .ai-message .message-content { 
+            background: white; 
+            border: 1px solid #e9ecef;
+        }
+        .chat-input { 
+            padding: 25px; 
+            background: white; 
+            border-top: 1px solid #e9ecef;
+            display: flex; 
+            gap: 15px;
+        }
+        #messageInput { 
+            flex: 1; 
+            padding: 15px 25px; 
+            border: 2px solid #e9ecef; 
+            border-radius: 30px; 
+            font-size: 16px;
+            outline: none;
+            transition: all 0.3s;
+        }
+        #messageInput:focus { 
+            border-color: #667eea; 
+            box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+        }
+        #sendBtn { 
+            padding: 15px 30px; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white; 
+            border: none; 
+            border-radius: 30px; 
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 16px;
+            transition: all 0.3s;
+        }
+        #sendBtn:hover:not(:disabled) { transform: scale(1.05); }
+        #sendBtn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .loading { 
+            display: flex; 
+            align-items: center; 
+            gap: 10px;
+            color: #666;
+        }
+        .spinner { 
+            width: 20px; height: 20px; 
+            border: 2px solid #f3f3f3; 
+            border-top: 2px solid #667eea; 
+            border-radius: 50%; 
+            animation: spin 1s linear infinite; 
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .status { padding: 20px; text-align: center; color: #666; }
+        .error { background: #fee; color: #c33; border: 1px solid #fcc; padding: 15px; border-radius: 10px; margin: 10px 25px; }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h1>🤖 Direct Hiring RAG Chatbot</h1>
+            
+        </div>
+        <div class="chat-messages" id="messages">
+            <div class="message ai-message">
+                <div class="message-content">
+                    Hi! How can I assist you today? 🚀
+                </div>
+            </div>
+        </div>
+        <div class="chat-input">
+            <input type="text" id="messageInput" placeholder="Type your question..." maxlength="1000">
+            <button id="sendBtn">Send 🚀</button>
+        </div>
+    </div>
+
+    <script>
+        const messagesEl = document.getElementById('messages');
+        const inputEl = document.getElementById('messageInput');
+        const sendBtn = document.getElementById('sendBtn');
+
+        // Config - CHANGE THIS
+        const FASTAPI_URL = 'http://localhost:8000/chat';
+
+        sendBtn.addEventListener('click', sendMessage);
+        inputEl.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        async function sendMessage() {
+            const message = inputEl.value.trim();
+            if (!message) return;
+
+            // Add user message
+            addMessage(message, 'user');
+            inputEl.value = '';
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<div class="loading"><div class="spinner"></div>Thinking...</div>';
+
+            try {
+                const response = await fetch(FASTAPI_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
+                });
+
+                const data = await response.json();
+                
+                if (response.ok) {
+                    addMessage(data.answer, 'ai');  // Clean answer only
+                } else {
+                    addMessage('Backend error: ' + data.detail || 'Unknown error', 'ai');
+                }
+            } catch (error) {
+                addMessage('Connection error. Is FastAPI running on port 8000?', 'ai');
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.innerHTML = 'Send 🚀';
+                inputEl.focus();
+            }
+        }
+
+        function addMessage(text, sender) {
+            const messageEl = document.createElement('div');
+            messageEl.className = `message ${sender}-message`;
+            messageEl.innerHTML = `<div class="message-content">${text.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+            messagesEl.appendChild(messageEl);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+    </script>
+</body>
+</html>
