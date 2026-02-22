@@ -31,7 +31,6 @@
             text-align: center; 
         }
         .chat-header h1 { font-size: 1.8em; margin-bottom: 5px; }
-        .chat-header p { opacity: 0.9; font-size: 1.1em; }
         .chat-messages { 
             flex: 1; 
             padding: 25px; 
@@ -43,7 +42,10 @@
             display: flex; 
             animation: fadeIn 0.3s ease;
         }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { 
+            from { opacity: 0; transform: translateY(10px); } 
+            to { opacity: 1; transform: translateY(0); } 
+        }
         .user-message { flex-direction: row-reverse; }
         .message-content { 
             max-width: 75%; 
@@ -51,6 +53,7 @@
             border-radius: 20px; 
             word-wrap: break-word;
             box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            white-space: pre-wrap;
         }
         .user-message .message-content { 
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -106,17 +109,18 @@
             border-radius: 50%; 
             animation: spin 1s linear infinite; 
         }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .status { padding: 20px; text-align: center; color: #666; }
-        .error { background: #fee; color: #c33; border: 1px solid #fcc; padding: 15px; border-radius: 10px; margin: 10px 25px; }
+        @keyframes spin { 
+            0% { transform: rotate(0deg); } 
+            100% { transform: rotate(360deg); } 
+        }
     </style>
 </head>
 <body>
     <div class="chat-container">
         <div class="chat-header">
             <h1>🤖 Direct Hiring RAG Chatbot</h1>
-            
         </div>
+
         <div class="chat-messages" id="messages">
             <div class="message ai-message">
                 <div class="message-content">
@@ -124,6 +128,7 @@
                 </div>
             </div>
         </div>
+
         <div class="chat-input">
             <input type="text" id="messageInput" placeholder="Type your question..." maxlength="1000">
             <button id="sendBtn">Send 🚀</button>
@@ -135,8 +140,14 @@
         const inputEl = document.getElementById('messageInput');
         const sendBtn = document.getElementById('sendBtn');
 
-        // Config - CHANGE THIS
-        const FASTAPI_URL = 'http://localhost:8000/chat';
+        // ✅ Streaming endpoint
+        const FASTAPI_STREAM_URL = 'http://localhost:8000/chat_stream';
+
+        // ✅ Typewriter speed (ms per character)
+        // Recommended: 25–35 for "human" feel
+        const TYPEWRITER_SPEED_MS = 28;
+
+        let currentStream = null;
 
         sendBtn.addEventListener('click', sendMessage);
         inputEl.addEventListener('keypress', (e) => {
@@ -146,45 +157,114 @@
             }
         });
 
-        async function sendMessage() {
+        function sendMessage() {
             const message = inputEl.value.trim();
             if (!message) return;
 
-            // Add user message
             addMessage(message, 'user');
             inputEl.value = '';
+
             sendBtn.disabled = true;
             sendBtn.innerHTML = '<div class="loading"><div class="spinner"></div>Thinking...</div>';
 
-            try {
-                const response = await fetch(FASTAPI_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message })
-                });
+            // Create empty AI message (we will stream into it)
+            const aiBubble = addMessage('', 'ai');
 
-                const data = await response.json();
-                
-                if (response.ok) {
-                    addMessage(data.answer, 'ai');  // Clean answer only
-                } else {
-                    addMessage('Backend error: ' + data.detail || 'Unknown error', 'ai');
+            // Close previous stream if any
+            if (currentStream) currentStream.close();
+
+            const params = new URLSearchParams({ message });
+            const streamUrl = `${FASTAPI_STREAM_URL}?${params.toString()}`;
+
+            const es = new EventSource(streamUrl);
+            currentStream = es;
+
+            // ✅ Typewriter state
+            let queue = "";
+            let typing = false;
+            let buffer = "";
+
+            function typeWriter() {
+                if (queue.length === 0) {
+                    typing = false;
+                    return;
                 }
-            } catch (error) {
-                addMessage('Connection error. Is FastAPI running on port 8000?', 'ai');
-            } finally {
+                typing = true;
+
+                // Add one character at a time
+                buffer += queue[0];
+                queue = queue.slice(1);
+
+                aiBubble.innerHTML = escapeHtml(buffer);
+                messagesEl.scrollTop = messagesEl.scrollHeight;
+
+                setTimeout(typeWriter, TYPEWRITER_SPEED_MS);
+            }
+
+            es.onmessage = (event) => {
+                const payload = JSON.parse(event.data);
+
+                if (payload.event === "delta") {
+                    queue += payload.delta;
+                    if (!typing) typeWriter();
+                }
+
+                if (payload.event === "done") {
+                    // Ensure any remaining queued chars flush
+                    // (optional: speed up final flush)
+                    // We'll just let it finish naturally.
+                    const checkFinish = setInterval(() => {
+                        if (!typing && queue.length === 0) {
+                            clearInterval(checkFinish);
+                            es.close();
+                            currentStream = null;
+
+                            sendBtn.disabled = false;
+                            sendBtn.innerHTML = 'Send 🚀';
+                            inputEl.focus();
+                        }
+                    }, 50);
+                }
+
+                if (payload.event === "error") {
+                    es.close();
+                    currentStream = null;
+
+                    aiBubble.innerHTML = "Error: " + escapeHtml(payload.message || "Unknown");
+                    sendBtn.disabled = false;
+                    sendBtn.innerHTML = 'Send 🚀';
+                    inputEl.focus();
+                }
+            };
+
+            es.onerror = () => {
+                es.close();
+                currentStream = null;
+
+                aiBubble.innerHTML = "Connection lost.";
                 sendBtn.disabled = false;
                 sendBtn.innerHTML = 'Send 🚀';
                 inputEl.focus();
-            }
+            };
         }
 
         function addMessage(text, sender) {
             const messageEl = document.createElement('div');
             messageEl.className = `message ${sender}-message`;
-            messageEl.innerHTML = `<div class="message-content">${text.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</div>`;
+
+            const contentEl = document.createElement('div');
+            contentEl.className = 'message-content';
+            contentEl.innerHTML = escapeHtml(text);
+
+            messageEl.appendChild(contentEl);
             messagesEl.appendChild(messageEl);
             messagesEl.scrollTop = messagesEl.scrollHeight;
+
+            return contentEl; // return bubble element so we can stream into it
+        }
+
+        function escapeHtml(text) {
+            return (text || "").replace(/</g, '&lt;').replace(/>/g, '&gt;');
         }
     </script>
 </body>

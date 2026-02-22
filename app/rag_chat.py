@@ -1,7 +1,7 @@
 import os
 import pickle
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Generator, Tuple, Optional
 
 import numpy as np
 from openai import OpenAI
@@ -29,6 +29,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 class RAGEngine:
     """
     STAGE 5-6: Query → Retrieval → Grounded Generation
+    Adds streaming generation for real-time UI output (Option A).
     """
 
     def __init__(self):
@@ -83,7 +84,7 @@ class RAGEngine:
     # ---------- Stage 5b: retrieve chunks ----------
 
     def stage_5b_retrieve_chunks(
-        self, query_embedding: List[float], top_k: int | None = None
+        self, query_embedding: List[float], top_k: Optional[int] = None
     ) -> List[Dict]:
         if top_k is None:
             top_k = TOP_K_RETRIEVAL
@@ -132,25 +133,30 @@ class RAGEngine:
 
         context = "\n\n---\n\n".join(context_parts)
 
-        prompt = f"""You are a friendly helpful assistant answering questions about the Direct Hiring Guide and helping users find relevant information from it. Speak naturally like you're chatting with a friend.
+        prompt = f"""You are a helpful assistant for Direct Hiring questions. Answer SHORT and DIRECTLY using ONLY the context.
 
-    IMPORTANT: Answer using only the context below. If you don't know something, just say "I don't have that info in the guide.""
+CRITICAL RULES:
+1. Use ONLY context below - say "Not in guide" if missing
+2. MAX 3-4 bullets or 2 short paragraphs
+3. Match question type:
+- "How/What/Process" → Simple steps (1-2-3)
+- "Benefits/Why" → 2-3 key points
+- "Features" → Short list
+- "General" → 1-2 sentences
+4. Casual, friendly tone like talking to a coworker
+5. NO bold, NO long explanations
 
-    Answer naturally in short paragraphs with bullet points where helpful. Use normal spacing and keep it conversational. Also make the conversation engaging and easy to read.
+CONTEXT:
+{context}
 
-    CONTEXT:
-    {context}
+QUESTION: {query}
 
-    QUESTION: {query}
-
-    Answer:"""
+Answer:"""
 
         logger.info("   ✓ Prompt length: %d chars", len(prompt))
         return prompt
 
-
-
-    # ---------- Stage 6b: call LLM ----------
+    # ---------- Stage 6b: call LLM (non-streaming, existing) ----------
 
     def stage_6b_generate_answer(self, prompt: str) -> tuple[str, bool]:
         logger.info("🧠 STAGE 6b: Calling LLM %s", LLM_MODEL)
@@ -163,23 +169,17 @@ class RAGEngine:
                     {
                         "role": "system",
                         "content": (
-                            "You are a friendly helpful AI assistant that answers questions. "
-                            "You must answer ONLY from the provided context and "
-                            "never hallucinate."
-                            "Always format answers for readability:\n"
-                           
-                            
-                            "Use simple bullet points (-) with NO bold formatting (**).\n"
-                            "Add blank lines between paragraphs and lists.\n"
-                            "Keep language simple and user-friendly."
-                            "Be warm and approachable."
-                            
+                            "You are a concise, friendly assistant. "
+                            "Give SHORT answers (3-4 bullets max). "
+                            "Match question type exactly. "
+                            "Casual tone, no formal language. "
+                            "Use ONLY provided context."
                         ),
                     },
                     {"role": "user", "content": prompt},
                 ],
             )
-            answer = response.choices[0].message.content
+            answer = response.choices[0].message.content or ""
             logger.info("   ✓ Answer length: %d chars", len(answer))
             return answer, fallback_used
         except Exception as e:
@@ -191,7 +191,83 @@ class RAGEngine:
                 fallback_used,
             )
 
-    # ---------- Public API: full pipeline ----------
+    # ---------- Stage 6b (NEW): call LLM with streaming ----------
+
+    def stage_6b_generate_answer_stream(
+        self, prompt: str
+    ) -> Generator[Tuple[str, bool, bool], None, None]:
+        """
+        Streams the answer from the LLM.
+
+        Yields tuples:
+          (delta_text, fallback_used, is_done)
+
+        - delta_text: incremental text chunk to append to UI
+        - fallback_used: True if something failed and we had to fallback
+        - is_done: True only at the final yield
+        """
+        logger.info("🧠 STAGE 6b (STREAM): Calling LLM %s", LLM_MODEL)
+        fallback_used = False
+
+        try:
+            stream = client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=LLM_TEMPERATURE,
+                stream=True,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a concise, friendly assistant. "
+                            "Give SHORT answers (3-4 bullets max). "
+                            "Match question type exactly. "
+                            "Casual tone, no formal language. "
+                            "Use ONLY provided context."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+
+            for chunk in stream:
+                # For Chat Completions streaming, the delta content is here:
+                # chunk.choices[0].delta.content
+                delta = ""
+                try:
+                    delta = chunk.choices[0].delta.content or ""
+                except Exception:
+                    delta = ""
+
+                if delta:
+                    yield (delta, fallback_used, False)
+
+            # final event
+            yield ("", fallback_used, True)
+
+        except Exception as e:
+            logger.error("LLM streaming error: %s", e)
+            fallback_used = True
+
+            # Send a fallback message as a single final chunk
+            msg = (
+                "I’m unable to generate an answer right now due to a technical issue. "
+                "Please try again in a moment."
+            )
+            yield (msg, fallback_used, True)
+
+    # ---------- Utility: build citations ----------
+
+    def _build_citations(self, retrieved_chunks: List[Dict]) -> List[Dict]:
+        return [
+            {
+                "source": c["source"],
+                "snippet": (c["text"][:200] + "..." if len(c["text"]) > 200 else c["text"]),
+                "score": c["similarity_score"],
+            }
+            for c in retrieved_chunks
+        ]
+
+    # ---------- Public API: full pipeline (non-streaming) ----------
 
     def answer(self, query: str) -> Dict:
         logger.info("=" * 60)
@@ -203,18 +279,7 @@ class RAGEngine:
         prompt = self.stage_6a_build_prompt(query, retrieved_chunks)
         answer, fallback_used = self.stage_6b_generate_answer(prompt)
 
-        citations = [
-            {
-                "source": c["source"],
-                "snippet": (
-                    c["text"][:200] + "..."
-                    if len(c["text"]) > 200
-                    else c["text"]
-                ),
-                "score": c["similarity_score"],
-            }
-            for c in retrieved_chunks
-        ]
+        citations = self._build_citations(retrieved_chunks)
 
         logger.info("=" * 60)
         logger.info("✅ ANSWER GENERATED")
@@ -227,8 +292,63 @@ class RAGEngine:
             "fallback_used": fallback_used,
         }
 
+    # ---------- Public API (NEW): full pipeline (streaming) ----------
+
+    def answer_stream(self, query: str) -> Generator[Dict[str, Any], None, None]:
+        """
+        Streaming version of answer().
+
+        Yields dict events suitable for SSE, e.g.
+          {"event": "delta", "delta": "..."}
+          {"event": "done", "answer": "...", "citations": [...], "fallback_used": false}
+        """
+        logger.info("=" * 60)
+        logger.info("❓ QUESTION (STREAM): %s", query)
+        logger.info("=" * 60)
+
+        # Retrieval happens first (one-time), then generation streams
+        query_embedding = self.stage_5a_embed_query(query)
+        retrieved_chunks = self.stage_5b_retrieve_chunks(query_embedding)
+        prompt = self.stage_6a_build_prompt(query, retrieved_chunks)
+        citations = self._build_citations(retrieved_chunks)
+
+        full_text_parts: List[str] = []
+        fallback_used_final = False
+
+        # optional start event
+        yield {"event": "start"}
+
+        for delta, fallback_used, is_done in self.stage_6b_generate_answer_stream(prompt):
+            fallback_used_final = fallback_used_final or fallback_used
+
+            if delta:
+                full_text_parts.append(delta)
+                yield {"event": "delta", "delta": delta}
+
+            if is_done:
+                final_answer = "".join(full_text_parts).strip()
+                logger.info("=" * 60)
+                logger.info("✅ ANSWER STREAM DONE (%d chars)", len(final_answer))
+                logger.info("=" * 60)
+
+                yield {
+                    "event": "done",
+                    "answer": final_answer,
+                    "citations": citations,
+                    "fallback_used": fallback_used_final,
+                }
+
 
 if __name__ == "__main__":
     engine = RAGEngine()
+
+    print("---- NON-STREAM ----")
     result = engine.answer("What is direct hiring?")
     print(result["answer"])
+
+    print("\n---- STREAM ----")
+    for ev in engine.answer_stream("What is direct hiring?"):
+        if ev["event"] == "delta":
+            print(ev["delta"], end="", flush=True)
+        elif ev["event"] == "done":
+            print("\n\nDONE")

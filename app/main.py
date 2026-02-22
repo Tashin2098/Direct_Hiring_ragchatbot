@@ -1,9 +1,11 @@
+import json
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
+from fastapi.responses import StreamingResponse
 from app.rag_chat import RAGEngine
 
 app = FastAPI(
@@ -89,6 +91,53 @@ def chat(request: ChatRequest):
             status_code=500,
             detail={"error": "INTERNAL_ERROR", "message": str(e)},
         )
+        
+
+@app.get("/chat_stream")
+def chat_stream(
+    message: str = Query(..., description="User message to answer"),
+):
+    """
+    Streams the answer token-by-token using Server-Sent Events (SSE).
+
+    Frontend will receive events like:
+      data: {"event":"start"}
+      data: {"event":"delta","delta":"Hello"}
+      data: {"event":"done","answer":"Hello ...", "citations":[...], "fallback_used":false}
+    """
+
+    if not message or not message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    if rag_engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail="RAG engine not initialized. Run indexing first.",
+        )
+
+    def sse_pack(obj: dict) -> str:
+        # SSE format: each message is "data: <json>\n\n"
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    def event_generator():
+        try:
+            for ev in rag_engine.answer_stream(message):
+                yield sse_pack(ev)
+        except Exception as e:
+            # If anything crashes mid-stream, send an error event
+            yield sse_pack(
+                {"event": "error", "message": str(e), "error": "INTERNAL_ERROR"}
+            )
+            yield sse_pack({"event": "done", "answer": "", "citations": [], "fallback_used": True})
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.get("/stats")
